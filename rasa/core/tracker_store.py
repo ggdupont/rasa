@@ -177,15 +177,15 @@ class RedisTrackerStore(TrackerStore):
         import redis
 
         self.is_sentinel = is_sentinel
+        self.record_exp = record_exp
         if not self.is_sentinel:
             self.red = redis.StrictRedis(host=host, port=port, db=db, password=password)
-            self.record_exp = record_exp
             super(RedisTrackerStore, self).__init__(domain, event_broker)
         else:
             from redis import sentinel  # pytype: disable=import-error
 
             redis_sentinel = sentinel.Sentinel(
-                [(host, sentinel_data[0]['sentinel_port'])], socket_timeout=sentinel_data[0]['socket_timeout']
+                [(sentinel_data[0]['sentinel_url'], sentinel_data[0]['sentinel_port'])], socket_timeout=sentinel_data[0]['socket_timeout']
             )
             master = redis_sentinel.master_for(
                 sentinel_data[0]['sentinel_name'], socket_timeout=sentinel_data[0]['socket_timeout']
@@ -205,20 +205,19 @@ class RedisTrackerStore(TrackerStore):
         serialised_tracker = self.serialise_tracker(tracker)
         self.redis_writer(tracker.sender_id, serialised_tracker, timeout)
 
-    def retrieve(self, sender_id):
-        stored = self.redis_reader(sender_id)
-        if stored is not None:
-            return self.deserialise_tracker(sender_id, stored)
-        else:
-            return None
-
     def redis_writer(self, sender_id, serialised_tracker, timeout):
         if not self.is_sentinel:
             redis = self.red
         else:
             redis, _ = self.sentinel
         redis.set(sender_id, serialised_tracker, ex=timeout)
-        pass
+
+    def retrieve(self, sender_id):
+        stored = self.redis_reader(sender_id)
+        if stored is not None:
+            return self.deserialise_tracker(sender_id, stored)
+        else:
+            return None
 
     def redis_reader(self, sender_id):
         if not self.is_sentinel:
@@ -227,7 +226,6 @@ class RedisTrackerStore(TrackerStore):
             _, slave = self.sentinel
             stored = slave.get(sender_id)
         return stored
-        pass
 
 
 class MongoTrackerStore(TrackerStore):
