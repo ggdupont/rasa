@@ -106,21 +106,24 @@ class EmbeddingIntentClassifier(Component):
     }
 
     def __init__(
-        self,
-        component_config: Optional[Dict[Text, Any]] = None,
-        inv_intent_dict: Optional[Dict[int, Text]] = None,
-        encoded_all_intents: Optional[np.ndarray] = None,
-        session: Optional["Session"] = None,
-        graph: Optional["Graph"] = None,
-        message_placeholder: Optional["Tensor"] = None,
-        intent_placeholder: Optional["Tensor"] = None,
-        similarity_op: Optional["Tensor"] = None,
-        word_embed: Optional["Tensor"] = None,
-        intent_embed: Optional["Tensor"] = None,
+            self,
+            component_config: Optional[Dict[Text, Any]] = None,
+            inv_intent_dict: Optional[Dict[int, Text]] = None,
+            encoded_all_intents: Optional[np.ndarray] = None,
+            session: Optional["Session"] = None,
+            graph: Optional["Graph"] = None,
+            message_placeholder: Optional["Tensor"] = None,
+            intent_placeholder: Optional["Tensor"] = None,
+            similarity_op: Optional["Tensor"] = None,
+            word_embed: Optional["Tensor"] = None,
+            intent_embed: Optional["Tensor"] = None,
     ) -> None:
         """Declare instant variables with default values"""
 
         self._check_tensorflow()
+
+        self._mirrored_strategy = tf.distribute.MirroredStrategy()
+
         super(EmbeddingIntentClassifier, self).__init__(component_config)
 
         self._load_params()
@@ -216,7 +219,7 @@ class EmbeddingIntentClassifier(Component):
 
     @staticmethod
     def _create_intent_token_dict(
-        intents: List[Text], intent_split_symbol: Text
+            intents: List[Text], intent_split_symbol: Text
     ) -> Dict[Text, int]:
         """Create intent token dictionary"""
 
@@ -257,7 +260,7 @@ class EmbeddingIntentClassifier(Component):
 
     # noinspection PyPep8Naming
     def _prepare_data_for_training(
-        self, training_data: "TrainingData", intent_dict: Dict[Text, int]
+            self, training_data: "TrainingData", intent_dict: Dict[Text, int]
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Prepare data for training"""
 
@@ -275,7 +278,7 @@ class EmbeddingIntentClassifier(Component):
 
     # tf helpers:
     def _create_tf_embed_nn(
-        self, x_in: "Tensor", is_training: "Tensor", layer_sizes: List[int], name: Text
+            self, x_in: "Tensor", is_training: "Tensor", layer_sizes: List[int], name: Text
     ) -> "Tensor":
         """Create nn with hidden layers and name"""
 
@@ -300,7 +303,7 @@ class EmbeddingIntentClassifier(Component):
         return x
 
     def _create_tf_embed(
-        self, a_in: "Tensor", b_in: "Tensor", is_training: "Tensor"
+            self, a_in: "Tensor", b_in: "Tensor", is_training: "Tensor"
     ) -> Tuple["Tensor", "Tensor"]:
         """Create tf graph for training"""
 
@@ -363,7 +366,7 @@ class EmbeddingIntentClassifier(Component):
 
     # training helpers:
     def _create_batch_b(
-        self, batch_pos_b: np.ndarray, intent_ids: np.ndarray
+            self, batch_pos_b: np.ndarray, intent_ids: np.ndarray
     ) -> np.ndarray:
         """Create batch of intents.
 
@@ -408,16 +411,27 @@ class EmbeddingIntentClassifier(Component):
         else:
             return int(self.batch_size[0])
 
+    # Trying to isolate training step for distributed training
+    # noinspection PyPep8Naming
+    def _train_tf_step_fn(self, inputs):
+        loss = inputs[0]
+        feed_dict = inputs[1]
+        batches_per_epoch = inputs[2]
+
+        sess_out = loss.eval(feed_dict, self.session)
+        return sess_out.get("loss") / batches_per_epoch
+
     # noinspection PyPep8Naming
     def _train_tf(
-        self,
-        X: np.ndarray,
-        Y: np.ndarray,
-        intents_for_X: np.ndarray,
-        loss: "Tensor",
-        is_training: "Tensor",
-        train_op: "Tensor",
+            self,
+            X: np.ndarray,
+            Y: np.ndarray,
+            intents_for_X: np.ndarray,
+            loss: "Tensor",
+            is_training: "Tensor",
+            train_op: "Tensor",
     ) -> None:
+
         """Train tf graph"""
 
         self.session.run(tf.global_variables_initializer())
@@ -431,51 +445,83 @@ class EmbeddingIntentClassifier(Component):
         pbar = tqdm(range(self.epochs), desc="Epochs", disable=is_logging_disabled())
         train_acc = 0
         last_loss = 0
-        for ep in pbar:
-            indices = np.random.permutation(len(X))
 
-            batch_size = self._linearly_increasing_batch_size(ep)
-            batches_per_epoch = len(X) // batch_size + int(len(X) % batch_size > 0)
+        with self._mirrored_strategy.scope():
 
-            ep_loss = 0
-            for i in range(batches_per_epoch):
-                end_idx = (i + 1) * batch_size
-                start_idx = i * batch_size
-                batch_a = X[indices[start_idx:end_idx]]
-                batch_pos_b = Y[indices[start_idx:end_idx]]
-                intents_for_b = intents_for_X[indices[start_idx:end_idx]]
-                # add negatives
-                batch_b = self._create_batch_b(batch_pos_b, intents_for_b)
+            for ep in pbar:
+                indices = np.random.permutation(len(X))
 
-                sess_out = self.session.run(
-                    {"loss": loss, "train_op": train_op},
-                    feed_dict={
+                batch_size = self._linearly_increasing_batch_size(ep)
+                batches_per_epoch = len(X) // batch_size + int(len(X) % batch_size > 0)
+
+                ep_loss = 0
+                for i in range(batches_per_epoch):
+                    end_idx = (i + 1) * batch_size
+                    start_idx = i * batch_size
+                    batch_a = X[indices[start_idx:end_idx]]
+                    batch_pos_b = Y[indices[start_idx:end_idx]]
+                    intents_for_b = intents_for_X[indices[start_idx:end_idx]]
+                    # add negatives
+                    batch_b = self._create_batch_b(batch_pos_b, intents_for_b)
+
+                    # sess_out = self.session.run(
+                    #     {"loss": loss, "train_op": train_op},
+                    #     feed_dict={
+                    #         self.a_in: batch_a,
+                    #         self.b_in: batch_b,
+                    #         is_training: True,
+                    #     },
+                    # )
+
+                    # ep_loss += sess_out.get("loss") / batches_per_epoch
+
+                    ###############################################
+                    # mirroring strategy
+                    ###############################################
+                    batch_a = tf.data.Dataset.from_tensor_slices(batch_a)
+                    batch_b = tf.data.Dataset.from_tensor_slices(batch_b)
+
+                    feed_dict = {
                         self.a_in: batch_a,
                         self.b_in: batch_b,
                         is_training: True,
-                    },
-                )
-                ep_loss += sess_out.get("loss") / batches_per_epoch
-
-            if self.evaluate_on_num_examples:
-                if (
-                    ep == 0
-                    or (ep + 1) % self.evaluate_every_num_epochs == 0
-                    or (ep + 1) == self.epochs
-                ):
-                    train_acc = self._output_training_stat(
-                        X, intents_for_X, is_training
-                    )
-                    last_loss = ep_loss
-
-                pbar.set_postfix(
-                    {
-                        "loss": "{:.3f}".format(ep_loss),
-                        "acc": "{:.3f}".format(train_acc),
                     }
-                )
-            else:
-                pbar.set_postfix({"loss": "{:.3f}".format(ep_loss)})
+
+                    dist_inputs = [loss, feed_dict, batches_per_epoch]
+
+                    #  This should not work
+                    ###############################################
+                    per_replica_losses = self._mirrored_strategy.extended.call_for_each_replica(self._train_tf_step_fn,
+                                                                                                args=(dist_inputs,))
+
+                    # per_replica_losses = self._mirrored_strategy.experimental_run_v2(
+                    #     self._train_tf_step_fn, args=(dist_inputs,))
+
+                    ###############################################
+
+                    mean_loos = self._mirrored_strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
+                                                               axis=None)
+                    ep_loss += mean_loos / batches_per_epoch
+
+                if self.evaluate_on_num_examples:
+                    if (
+                            ep == 0
+                            or (ep + 1) % self.evaluate_every_num_epochs == 0
+                            or (ep + 1) == self.epochs
+                    ):
+                        train_acc = self._output_training_stat(
+                            X, intents_for_X, is_training
+                        )
+                        last_loss = ep_loss
+
+                    pbar.set_postfix(
+                        {
+                            "loss": "{:.3f}".format(ep_loss),
+                            "acc": "{:.3f}".format(train_acc),
+                        }
+                    )
+                else:
+                    pbar.set_postfix({"loss": "{:.3f}".format(ep_loss)})
 
         if self.evaluate_on_num_examples:
             logger.info(
@@ -486,7 +532,7 @@ class EmbeddingIntentClassifier(Component):
 
     # noinspection PyPep8Naming
     def _output_training_stat(
-        self, X: np.ndarray, intents_for_X: np.ndarray, is_training: "Tensor"
+            self, X: np.ndarray, intents_for_X: np.ndarray, is_training: "Tensor"
     ) -> np.ndarray:
         """Output training statistics"""
 
@@ -503,10 +549,10 @@ class EmbeddingIntentClassifier(Component):
         return train_acc
 
     def train(
-        self,
-        training_data: "TrainingData",
-        cfg: Optional["RasaNLUModelConfig"] = None,
-        **kwargs: Any
+            self,
+            training_data: "TrainingData",
+            cfg: Optional["RasaNLUModelConfig"] = None,
+            **kwargs: Any
     ) -> None:
         """Train the embedding intent classifier on a data set."""
 
@@ -564,7 +610,7 @@ class EmbeddingIntentClassifier(Component):
     # process helpers
     # noinspection PyPep8Naming
     def _calculate_message_sim(
-        self, X: np.ndarray, all_Y: np.ndarray
+            self, X: np.ndarray, all_Y: np.ndarray
     ) -> Tuple[np.ndarray, List[float]]:
         """Load tf graph and calculate message similarities"""
 
@@ -668,11 +714,11 @@ class EmbeddingIntentClassifier(Component):
             saver.save(self.session, checkpoint)
 
         with io.open(
-            os.path.join(model_dir, file_name + "_inv_intent_dict.pkl"), "wb"
+                os.path.join(model_dir, file_name + "_inv_intent_dict.pkl"), "wb"
         ) as f:
             pickle.dump(self.inv_intent_dict, f)
         with io.open(
-            os.path.join(model_dir, file_name + "_encoded_all_intents.pkl"), "wb"
+                os.path.join(model_dir, file_name + "_encoded_all_intents.pkl"), "wb"
         ) as f:
             pickle.dump(self.encoded_all_intents, f)
 
@@ -680,12 +726,12 @@ class EmbeddingIntentClassifier(Component):
 
     @classmethod
     def load(
-        cls,
-        meta: Dict[Text, Any],
-        model_dir: Text = None,
-        model_metadata: "Metadata" = None,
-        cached_component: Optional["EmbeddingIntentClassifier"] = None,
-        **kwargs: Any
+            cls,
+            meta: Dict[Text, Any],
+            model_dir: Text = None,
+            model_metadata: "Metadata" = None,
+            cached_component: Optional["EmbeddingIntentClassifier"] = None,
+            **kwargs: Any
     ) -> "EmbeddingIntentClassifier":
 
         if model_dir and meta.get("file"):
@@ -707,11 +753,11 @@ class EmbeddingIntentClassifier(Component):
                 intent_embed = tf.get_collection("intent_embed")[0]
 
             with io.open(
-                os.path.join(model_dir, file_name + "_inv_intent_dict.pkl"), "rb"
+                    os.path.join(model_dir, file_name + "_inv_intent_dict.pkl"), "rb"
             ) as f:
                 inv_intent_dict = pickle.load(f)
             with io.open(
-                os.path.join(model_dir, file_name + "_encoded_all_intents.pkl"), "rb"
+                    os.path.join(model_dir, file_name + "_encoded_all_intents.pkl"), "rb"
             ) as f:
                 encoded_all_intents = pickle.load(f)
 
